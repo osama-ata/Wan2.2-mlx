@@ -33,6 +33,15 @@ def init_weights(module: nn.Module):
     return module
 
 
+def _cast_model_dtype(model: nn.Module, dtype):
+    """Cast all model parameters to the specified dtype."""
+    for name, param in model.named_parameters():
+        if hasattr(param, 'astype'):
+            # Update the parameter in place
+            setattr(model, name.split('.')[-1], param.astype(dtype))
+    return model
+
+
 class T5LayerNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-6):
@@ -421,6 +430,7 @@ def _t5(name,
 
     # init model
     model = model_cls(**kwargs)
+    _cast_model_dtype(model, dtype)
 
     # init tokenizer
     if return_tokenizer:

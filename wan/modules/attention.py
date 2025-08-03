@@ -74,9 +74,14 @@ def attention(
         
         out = score @ v
     else:
-        out = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=softmax_scale
-        )
+        # Manual implementation of scaled dot-product attention for non-causal case
+        score = (q @ k.transpose(0, 1, 3, 2)) * (1.0 / mx.sqrt(q.shape[-1]))
+        if softmax_scale is not None:
+            score = score * softmax_scale
+        score = mx.softmax(score, axis=-1)
+        if dropout_p > 0.0:
+            score = nn.Dropout(p=dropout_p)(score)
+        out = score @ v
 
     # Transpose back to [B, L, num_heads, C]
     out = out.transpose(0, 2, 1, 3)
