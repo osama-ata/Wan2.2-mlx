@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import mlx.core as mx
 from easydict import EasyDict
 
 from .shared_config import wan_shared_cfg
@@ -9,11 +10,15 @@ ti2v_5B = EasyDict(__name__='Config: Wan TI2V 5B')
 ti2v_5B.update(wan_shared_cfg)
 
 # t5
-ti2v_5B.t5_checkpoint = 'models_t5_umt5-xxl-enc-bf16.pth'
+ti2v_5B.t5_model = 'umt5_xxl'
+ti2v_5B.t5_dtype = mx.bfloat16
+ti2v_5B.text_len = 512
+ti2v_5B.param_dtype = mx.bfloat16
+ti2v_5B.t5_checkpoint = 't5_encoder_mlx.safetensors'
 ti2v_5B.t5_tokenizer = 'google/umt5-xxl'
 
 # vae
-ti2v_5B.vae_checkpoint = 'Wan2.2_VAE.pth'
+ti2v_5B.vae_checkpoint = 'vae_mlx.safetensors'
 ti2v_5B.vae_stride = (4, 16, 16)
 
 # transformer
@@ -34,3 +39,7 @@ ti2v_5B.sample_shift = 5.0
 ti2v_5B.sample_steps = 50
 ti2v_5B.sample_guide_scale = 5.0
 ti2v_5B.frame_num = 121
+
+# model checkpoints for MLX
+ti2v_5B.low_noise_checkpoint = 'wan_model_mlx.safetensors'
+ti2v_5B.high_noise_checkpoint = 'wan_model_mlx.safetensors'

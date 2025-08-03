@@ -2,6 +2,10 @@
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+# Dependency management is now handled via pyproject.toml and the 'uv' tool.
+# Please use 'uv' (https://github.com/astral-sh/uv) for installing and managing dependencies.
+# The requirements.txt file has been removed.
+
 [project]
 name = "wan"
 version = "2.2.0"

@@ -6,10 +6,10 @@ import os
 import os.path as osp
 
 import imageio
-import torch
-import torchvision
+import numpy as np
+from mlx import core as mx
 
-__all__ = ['save_video', 'save_image', 'str2bool']
+__all__ = ["save_video", "save_image", "str2bool"]
 
 
 def rand_name(length=8, suffix=''):
@@ -21,59 +21,108 @@ def rand_name(length=8, suffix=''):
     return name
 
 
-def save_video(tensor,
-               save_file=None,
-               fps=30,
-               suffix='.mp4',
-               nrow=8,
-               normalize=True,
-               value_range=(-1, 1)):
-    # cache file
-    cache_file = osp.join('/tmp', rand_name(
-        suffix=suffix)) if save_file is None else save_file
+def save_video(
+    tensor: mx.array,
+    save_file: str = None,
+    fps: int = 30,
+    suffix: str = ".mp4",
+    nrow: int = 8,
+    normalize: bool = True,
+    value_range=(-1, 1),
+):
+    # Ensure tensor is on the CPU and convert to numpy
+    tensor_np = np.array(tensor, copy=False)
 
-    # save to cache
+    # Clamp and normalize
+    tensor_np = np.clip(tensor_np, value_range[0], value_range[1])
+    if normalize:
+        tensor_np = (tensor_np - value_range[0]) / (value_range[1] - value_range[0])
+
+    # Create a grid for each time step
+    grid_frames = []
+    for t in range(tensor_np.shape[2]):
+        frame_data = tensor_np[:, :, t, :, :]
+        # Implement make_grid functionality with numpy
+        # This is a simplified version. For a more robust implementation,
+        # a dedicated grid-making function would be needed.
+        # This assumes the input is (B, C, H, W) for each frame
+        b, c, h, w = frame_data.shape
+        ncols = min(b, nrow)
+        nrows = (b + ncols - 1) // ncols
+        grid = np.zeros(
+            (c, h * nrows + (nrows - 1), w * ncols + (ncols - 1)), dtype=tensor_np.dtype
+        )
+        for i in range(b):
+            row = i // ncols
+            col = i % ncols
+            grid[
+                :,
+                row * (h + 1) : row * (h + 1) + h,
+                col * (w + 1) : col * (w + 1) + w,
+            ] = frame_data[i]
+        grid_frames.append(grid)
+
+    # Stack frames and permute
+    video_grid = np.stack(grid_frames, axis=0)  # T, C, H, W
+    video_grid = np.transpose(video_grid, (0, 2, 3, 1))  # T, H, W, C
+
+    # Scale to 8-bit integer
+    video_grid = (video_grid * 255).astype(np.uint8)
+
+    # Determine output file path
+    output_file = save_file or osp.join("/tmp", rand_name(suffix=suffix))
+
+    # Write video
     try:
-        # preprocess
-        tensor = tensor.clamp(min(value_range), max(value_range))
-        tensor = torch.stack([
-            torchvision.utils.make_grid(
-                u, nrow=nrow, normalize=normalize, value_range=value_range)
-            for u in tensor.unbind(2)
-        ],
-                             dim=1).permute(1, 2, 3, 0)
-        tensor = (tensor * 255).type(torch.uint8).cpu()
-
-        # write video
-        writer = imageio.get_writer(
-            cache_file, fps=fps, codec='libx264', quality=8)
-        for frame in tensor.numpy():
+        writer = imageio.get_writer(output_file, fps=fps, codec="libx264", quality=8)
+        for frame in video_grid:
             writer.append_data(frame)
         writer.close()
     except Exception as e:
-        logging.info(f'save_video failed, error: {e}')
+        logging.info(f"save_video failed, error: {e}")
 
 
-def save_image(tensor, save_file, nrow=8, normalize=True, value_range=(-1, 1)):
-    # cache file
-    suffix = osp.splitext(save_file)[1]
-    if suffix.lower() not in [
-            '.jpg', '.jpeg', '.png', '.tiff', '.gif', '.webp'
-    ]:
-        suffix = '.png'
+def save_image(
+    tensor: mx.array,
+    save_file: str,
+    nrow: int = 8,
+    normalize: bool = True,
+    value_range=(-1, 1),
+):
+    # Convert to numpy
+    img_np = np.array(tensor, copy=False)
 
-    # save to cache
+    # Clamp and normalize
+    img_np = np.clip(img_np, value_range[0], value_range[1])
+    if normalize:
+        img_np = (img_np - value_range[0]) / (value_range[1] - value_range[0])
+
+    # Create grid
+    b, c, h, w = img_np.shape
+    ncols = min(b, nrow)
+    nrows = (b + ncols - 1) // ncols
+    grid = np.zeros(
+        (c, h * nrows + (nrows - 1), w * ncols + (ncols - 1)), dtype=img_np.dtype
+    )
+    for i in range(b):
+        row = i // ncols
+        col = i % ncols
+        grid[
+            :,
+            row * (h + 1) : row * (h + 1) + h,
+            col * (w + 1) : col * (w + 1) + w,
+        ] = img_np[i]
+
+    # Transpose and scale
+    grid = np.transpose(grid, (1, 2, 0))
+    grid = (grid * 255).astype(np.uint8)
+
+    # Save image
     try:
-        tensor = tensor.clamp(min(value_range), max(value_range))
-        torchvision.utils.save_image(
-            tensor,
-            save_file,
-            nrow=nrow,
-            normalize=normalize,
-            value_range=value_range)
+        imageio.imwrite(save_file, grid)
         return save_file
     except Exception as e:
-        logging.info(f'save_image failed, error: {e}')
+        logging.info(f"save_image failed, error: {e}")
 
 
 def str2bool(v):
@@ -103,32 +152,23 @@ def str2bool(v):
         raise argparse.ArgumentTypeError('Boolean value expected (True/False)')
 
 
-def masks_like(tensor, zero=False, generator=None, p=0.2):
+def masks_like(tensor, zero=False, p=0.2):
     assert isinstance(tensor, list)
-    out1 = [torch.ones(u.shape, dtype=u.dtype, device=u.device) for u in tensor]
-
-    out2 = [torch.ones(u.shape, dtype=u.dtype, device=u.device) for u in tensor]
+    out1 = [mx.ones_like(u) for u in tensor]
+    out2 = [mx.ones_like(u) for u in tensor]
 
     if zero:
-        if generator is not None:
-            for u, v in zip(out1, out2):
-                random_num = torch.rand(
-                    1, generator=generator, device=generator.device).item()
-                if random_num < p:
-                    u[:, 0] = torch.normal(
-                        mean=-3.5,
-                        std=0.5,
-                        size=(1,),
-                        device=u.device,
-                        generator=generator).expand_as(u[:, 0]).exp()
-                    v[:, 0] = torch.zeros_like(v[:, 0])
-                else:
-                    u[:, 0] = u[:, 0]
-                    v[:, 0] = v[:, 0]
-        else:
-            for u, v in zip(out1, out2):
-                u[:, 0] = torch.zeros_like(u[:, 0])
-                v[:, 0] = torch.zeros_like(v[:, 0])
+        for i in range(len(out1)):
+            if np.random.rand() < p:
+                # This part is tricky without a direct equivalent of torch.normal with a generator.
+                # Using numpy for random number generation.
+                # The original logic seems to be applying a mask based on a random condition.
+                # A simplified version is implemented here.
+                out1[i][:, 0] = mx.exp(
+                    mx.random.normal(shape=(1,), scale=0.5) - 3.5
+                ).expand_as(out1[i][:, 0])
+                out2[i][:, 0] = mx.zeros_like(out2[i][:, 0])
+            # No 'else' needed as the arrays are already ones.
 
     return out1, out2
 

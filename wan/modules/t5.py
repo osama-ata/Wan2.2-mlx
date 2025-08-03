@@ -23,23 +23,23 @@ def fp16_clamp(x):
     return x
 
 
-def init_weights(m):
-    if isinstance(m, T5LayerNorm):
-        m.weight = mx.ones_like(m.weight)
-    elif isinstance(m, T5Model):
-        m.token_embedding.weight = mx.random.normal(m.token_embedding.weight.shape, std=1.0)
-    elif isinstance(m, T5FeedForward):
-        m.gate[0].weight = mx.random.normal(m.gate[0].weight.shape, std=m.dim**-0.5)
-        m.fc1.weight = mx.random.normal(m.fc1.weight.shape, std=m.dim**-0.5)
-        m.fc2.weight = mx.random.normal(m.fc2.weight.shape, std=m.dim_ffn**-0.5)
-    elif isinstance(m, T5Attention):
-        m.q.weight = mx.random.normal(m.q.weight.shape, std=(m.dim * m.dim_attn)**-0.5)
-        m.k.weight = mx.random.normal(m.k.weight.shape, std=m.dim**-0.5)
-        m.v.weight = mx.random.normal(m.v.weight.shape, std=m.dim**-0.5)
-        m.o.weight = mx.random.normal(m.o.weight.shape, std=(m.num_heads * m.dim_attn)**-0.5)
-    elif isinstance(m, T5RelativeEmbedding):
-        m.embedding.weight = mx.random.normal(
-            m.embedding.weight.shape, std=(2 * m.num_buckets * m.num_heads)**-0.5)
+def init_weights(module: nn.Module):
+    if isinstance(module, nn.Linear):
+        module.weight = mx.random.normal(module.weight.shape, std=0.02)
+        if module.bias is not None:
+            module.bias = mx.zeros_like(module.bias)
+    elif isinstance(module, nn.Embedding):
+        module.weight = mx.random.normal(module.weight.shape, std=0.02)
+    return module
+
+
+def _cast_model_dtype(model: nn.Module, dtype):
+    """Cast all model parameters to the specified dtype."""
+    for name, param in model.named_parameters():
+        if hasattr(param, 'astype'):
+            # Update the parameter in place
+            setattr(model, name.split('.')[-1], param.astype(dtype))
+    return model
 
 
 class T5LayerNorm(nn.Module):
@@ -120,13 +120,15 @@ class T5FeedForward(nn.Module):
         self.dim_ffn = dim_ffn
 
         # layers
-        self.gate = nn.Sequential(nn.Linear(dim, dim_ffn, bias=False), nn.GELU())
+        self.gate = [nn.Linear(dim, dim_ffn, bias=False)]
         self.fc1 = nn.Linear(dim, dim_ffn, bias=False)
         self.fc2 = nn.Linear(dim_ffn, dim, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def __call__(self, x):
-        x = self.fc1(x) * self.gate(x)
+        hidden_gelu = nn.gelu(self.gate[0](x))
+        hidden_linear = self.fc1(x)
+        x = hidden_gelu * hidden_linear
         x = self.dropout(x)
         x = self.fc2(x)
         x = self.dropout(x)
