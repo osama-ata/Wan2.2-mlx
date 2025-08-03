@@ -9,11 +9,9 @@ import types
 from contextlib import contextmanager
 from functools import partial
 
+import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
-import torch
-import torch.cuda.amp as amp
-import torch.distributed as dist
-import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
 from .distributed.fsdp import shard_model
@@ -28,6 +26,31 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+
+
+def image_to_tensor(img):
+    """
+    Convert PIL Image to MLX array tensor and normalize.
+    Equivalent to TF.to_tensor(img).sub_(0.5).div_(0.5)
+    """
+    # Convert PIL image to numpy array
+    img_array = np.array(img)
+    
+    # Convert to float and normalize to [0, 1]
+    if img_array.dtype == np.uint8:
+        img_array = img_array.astype(np.float32) / 255.0
+    
+    # Rearrange from HWC to CHW format
+    if len(img_array.shape) == 3:
+        img_array = np.transpose(img_array, (2, 0, 1))
+    
+    # Convert to MLX array
+    img_tensor = mx.array(img_array)
+    
+    # Normalize from [0, 1] to [-1, 1]
+    img_tensor = (img_tensor - 0.5) / 0.5
+    
+    return img_tensor
 
 
 class WanI2V:
@@ -71,11 +94,11 @@ class WanI2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        # MLX uses unified memory architecture - no explicit device management needed
         self.config = config
         self.rank = rank
-        self.t5_cpu = t5_cpu
-        self.init_on_cpu = init_on_cpu
+        self.t5_cpu = t5_cpu  # Keep for compatibility but not used in MLX
+        self.init_on_cpu = init_on_cpu  # Keep for compatibility but not used in MLX
 
         self.num_train_timesteps = config.num_train_timesteps
         self.boundary = config.boundary
@@ -88,7 +111,7 @@ class WanI2V:
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
-            device=torch.device('cpu'),
+            device=None,  # MLX doesn't need explicit device
             checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
             shard_fn=shard_fn if t5_fsdp else None,
@@ -97,8 +120,8 @@ class WanI2V:
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
         self.vae = Wan2_1_VAE(
-            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
+            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint))
+            # MLX doesn't need explicit device parameter
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.low_noise_model = WanModel.from_pretrained(
@@ -132,7 +155,7 @@ class WanI2V:
         applying distributed parallel strategy, and handling device placement.
 
         Args:
-            model (torch.nn.Module):
+            model (mlx.nn.Module):
                 The model instance to configure.
             use_sp (`bool`):
                 Enable distribution strategy of sequence parallel.
@@ -145,10 +168,11 @@ class WanI2V:
                 Only works without FSDP.
 
         Returns:
-            torch.nn.Module:
+            mlx.nn.Module:
                 The configured model.
         """
-        model.eval().requires_grad_(False)
+        # MLX models don't have eval() method like PyTorch
+        # Model weights are frozen by default for inference
 
         if use_sp:
             for block in model.blocks:
@@ -156,16 +180,17 @@ class WanI2V:
                     sp_attn_forward, block.self_attn)
             model.forward = types.MethodType(sp_dit_forward, model)
 
-        if dist.is_initialized():
-            dist.barrier()
+        # MLX doesn't need distributed barriers or explicit device management
+        # Commenting out distributed code for now - may need to implement MLX alternatives
+        # if dist.is_initialized():
+        #     dist.barrier()
 
         if dit_fsdp:
             model = shard_fn(model)
         else:
-            if convert_model_dtype:
-                model.to(self.param_dtype)
-            if not self.init_on_cpu:
-                model.to(self.device)
+            # MLX uses unified memory - no explicit device placement needed
+            # Type conversion can be handled during model loading
+            pass
 
         return model
 
@@ -174,17 +199,18 @@ class WanI2V:
         Prepares and returns the required model for the current timestep.
 
         Args:
-            t (torch.Tensor):
+            t (mlx.core.array):
                 current timestep.
             boundary (`int`):
                 The timestep threshold. If `t` is at or above this value,
                 the `high_noise_model` is considered as the required model.
             offload_model (`bool`):
                 A flag intended to control the offloading behavior.
+                Note: MLX uses unified memory so explicit offloading is not needed.
 
         Returns:
-            torch.nn.Module:
-                The active model on the target device for the current timestep.
+            mlx.nn.Module:
+                The active model for the current timestep.
         """
         if t.item() >= boundary:
             required_model_name = 'high_noise_model'
@@ -192,15 +218,12 @@ class WanI2V:
         else:
             required_model_name = 'low_noise_model'
             offload_model_name = 'high_noise_model'
-        if offload_model or self.init_on_cpu:
-            if next(getattr(
-                    self,
-                    offload_model_name).parameters()).device.type == 'cuda':
-                getattr(self, offload_model_name).to('cpu')
-            if next(getattr(
-                    self,
-                    required_model_name).parameters()).device.type == 'cpu':
-                getattr(self, required_model_name).to(self.device)
+        
+        # MLX uses unified memory architecture - no explicit device management needed
+        # if offload_model or self.init_on_cpu:
+        #     # Device placement not needed in MLX
+        #     pass
+            
         return getattr(self, required_model_name)
 
     def generate(self,
@@ -246,7 +269,7 @@ class WanI2V:
                 If True, offloads models to CPU during generation to save VRAM
 
         Returns:
-            torch.Tensor:
+            mlx.core.array:
                 Generated video frames tensor. Dimensions: (C, N H, W) where:
                 - C: Color channels (3 for RGB)
                 - N: Number of frames (81)
@@ -256,7 +279,7 @@ class WanI2V:
         # preprocess
         guide_scale = (guide_scale, guide_scale) if isinstance(
             guide_scale, float) else guide_scale
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+        img = image_to_tensor(img)  # Use our MLX-compatible function
 
         F = frame_num
         h, w = img.shape[1:]
@@ -275,24 +298,21 @@ class WanI2V:
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=self.device)
-        seed_g.manual_seed(seed)
-        noise = torch.randn(
-            16,
-            (F - 1) // self.vae_stride[0] + 1,
-            lat_h,
-            lat_w,
-            dtype=torch.float32,
-            generator=seed_g,
-            device=self.device)
+        # MLX uses random module for seeding
+        mx.random.seed(seed)
+        noise = mx.random.normal(
+            shape=(16,
+                   (F - 1) // self.vae_stride[0] + 1,
+                   lat_h,
+                   lat_w),
+            dtype=mx.float32)
 
-        msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
-        msk[:, 1:] = 0
-        msk = torch.concat([
-            torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
-        ],
-                           dim=1)
-        msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
+        msk = mx.ones((1, F, lat_h, lat_w))
+        msk = msk.at[:, 1:].set(0)
+        msk = mx.concatenate([
+            mx.repeat(msk[:, 0:1], repeats=4, axis=1), msk[:, 1:]
+        ], axis=1)
+        msk = msk.reshape(1, msk.shape[1] // 4, 4, lat_h, lat_w)
         msk = msk.transpose(1, 2)[0]
 
         if n_prompt == "":
@@ -300,27 +320,25 @@ class WanI2V:
 
         # preprocess
         if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
-                self.text_encoder.model.cpu()
+            # MLX doesn't need explicit device placement
+            context = self.text_encoder([input_prompt], None)
+            context_null = self.text_encoder([n_prompt], None)
+            # No need to offload in MLX
         else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+            context = self.text_encoder([input_prompt], None)
+            context_null = self.text_encoder([n_prompt], None)
+            # No need for explicit device transfer in MLX
 
         y = self.vae.encode([
-            torch.concat([
-                torch.nn.functional.interpolate(
-                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
-                torch.zeros(3, F - 1, h, w)
-            ],
-                         dim=1).to(self.device)
+            mx.concatenate([
+                # For now, we'll need to implement interpolation differently in MLX
+                # This is a placeholder - the actual interpolation will need to be 
+                # implemented in the VAE or a separate utility function
+                mx.expand_dims(img, 1),  # Add batch dimension and expand to video
+                mx.zeros((3, F - 1, h, w))
+            ], axis=1)
         ])[0]
-        y = torch.concat([msk, y])
+        y = mx.concatenate([msk, y], axis=0)
 
         @contextmanager
         def noop_no_sync():
@@ -331,10 +349,8 @@ class WanI2V:
         no_sync_high_noise = getattr(self.high_noise_model, 'no_sync',
                                      noop_no_sync)
 
-        # evaluation mode
+        # MLX evaluation mode - no need for explicit autocast or no_grad
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
-                torch.no_grad(),
                 no_sync_low_noise(),
                 no_sync_high_noise(),
         ):
@@ -346,7 +362,7 @@ class WanI2V:
                     shift=1,
                     use_dynamic_shifting=False)
                 sample_scheduler.set_timesteps(
-                    sampling_steps, device=self.device, shift=shift)
+                    sampling_steps, device=None, shift=shift)  # MLX doesn't need device
                 timesteps = sample_scheduler.timesteps
             elif sample_solver == 'dpm++':
                 sample_scheduler = FlowDPMSolverMultistepScheduler(
@@ -356,7 +372,7 @@ class WanI2V:
                 sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
                 timesteps, _ = retrieve_timesteps(
                     sample_scheduler,
-                    device=self.device,
+                    device=None,  # MLX doesn't need device
                     sigmas=sampling_sigmas)
             else:
                 raise NotImplementedError("Unsupported solver.")
@@ -376,14 +392,13 @@ class WanI2V:
                 'y': [y],
             }
 
-            if offload_model:
-                torch.cuda.empty_cache()
+            # MLX doesn't need explicit cache management
 
             for _, t in enumerate(tqdm(timesteps)):
-                latent_model_input = [latent.to(self.device)]
+                latent_model_input = [latent]
                 timestep = [t]
 
-                timestep = torch.stack(timestep).to(self.device)
+                timestep = mx.stack(timestep)
 
                 model = self._prepare_model_for_timestep(
                     t, boundary, offload_model)
@@ -392,40 +407,39 @@ class WanI2V:
 
                 noise_pred_cond = model(
                     latent_model_input, t=timestep, **arg_c)[0]
-                if offload_model:
-                    torch.cuda.empty_cache()
+                # MLX doesn't need explicit cache management
                 noise_pred_uncond = model(
                     latent_model_input, t=timestep, **arg_null)[0]
-                if offload_model:
-                    torch.cuda.empty_cache()
+                # MLX doesn't need explicit cache management
                 noise_pred = noise_pred_uncond + sample_guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
 
                 temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0),
+                    mx.expand_dims(noise_pred, 0),
                     t,
-                    latent.unsqueeze(0),
-                    return_dict=False,
-                    generator=seed_g)[0]
-                latent = temp_x0.squeeze(0)
+                    mx.expand_dims(latent, 0),
+                    return_dict=False)[0]  # Remove generator parameter for MLX
+                latent = mx.squeeze(temp_x0, 0)
 
                 x0 = [latent]
                 del latent_model_input, timestep
 
-            if offload_model:
-                self.low_noise_model.cpu()
-                self.high_noise_model.cpu()
-                torch.cuda.empty_cache()
+            # MLX doesn't need explicit model offloading or cache management
+            # if offload_model:
+            #     self.low_noise_model.cpu()
+            #     self.high_noise_model.cpu()
+            #     torch.cuda.empty_cache()
 
             if self.rank == 0:
                 videos = self.vae.decode(x0)
 
         del noise, latent, x0
         del sample_scheduler
-        if offload_model:
-            gc.collect()
-            torch.cuda.synchronize()
-        if dist.is_initialized():
-            dist.barrier()
+        # MLX doesn't need explicit memory management
+        # if offload_model:
+        #     gc.collect()
+        #     torch.cuda.synchronize()
+        # if dist.is_initialized():
+        #     dist.barrier()
 
         return videos[0] if self.rank == 0 else None

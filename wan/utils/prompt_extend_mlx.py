@@ -24,7 +24,7 @@ DEFAULT_SYS_PROMPTS = {
         "en": T2V_A14B_EN_SYS_PROMPT,
     },
     "i2v-A14B": {
-        "zh": T2V_A14B_ZH_SYS_PROMPT,  # Use T2V prompt as fallback for I2V Chinese
+        "zh": I2V_A14B_ZH_SYS_PROMPT,
         "en": I2V_A14B_EN_SYS_PROMPT,
     },
 }
@@ -201,31 +201,3 @@ def extend_prompt_with_qwen(
     """
     extender = create_prompt_extender()
     return extender.extend_prompt(prompt, task_type, language, image)
-
-
-# Compatibility classes for existing generate.py script
-class DashScopePromptExpander:
-    """Compatibility class for DashScope prompt expansion"""
-    
-    def __init__(self, model_name: str = "qwen-vl-max", task: str = "t2v-A14B", is_vl: bool = False):
-        self.model_name = model_name
-        self.task = task
-        self.is_vl = is_vl
-        self.extender = create_prompt_extender(model_name=model_name)
-    
-    def extend_prompt(self, prompt: str, language: str = "en", image: Optional[Image.Image] = None) -> str:
-        return self.extender.extend_prompt(prompt, self.task, language, image)
-
-
-class QwenPromptExpander:
-    """Compatibility class for Qwen prompt expansion"""
-    
-    def __init__(self, model_name: str = "qwen-vl-max", task: str = "t2v-A14B", is_vl: bool = False, device=None):
-        self.model_name = model_name
-        self.task = task
-        self.is_vl = is_vl
-        self.device = device  # Ignored in MLX version
-        self.extender = create_prompt_extender(model_name=model_name)
-    
-    def extend_prompt(self, prompt: str, language: str = "en", image: Optional[Image.Image] = None) -> str:
-        return self.extender.extend_prompt(prompt, self.task, language, image)

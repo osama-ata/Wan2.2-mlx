@@ -35,10 +35,20 @@ def init_weights(module: nn.Module):
 
 def _cast_model_dtype(model: nn.Module, dtype):
     """Cast all model parameters to the specified dtype."""
-    for name, param in model.named_parameters():
-        if hasattr(param, 'astype'):
-            # Update the parameter in place
-            setattr(model, name.split('.')[-1], param.astype(dtype))
+    # In MLX, we cast the model by updating its parameters
+    # MLX modules handle dtype conversion differently
+    try:
+        # For MLX models, we can try to cast the entire model
+        if hasattr(model, 'astype'):
+            model = model.astype(dtype)
+        # Alternative: iterate through model parameters if available
+        elif hasattr(model, 'parameters'):
+            for param in model.parameters():
+                if hasattr(param, 'astype'):
+                    param = param.astype(dtype)
+    except Exception as e:
+        # If casting fails, log warning but continue
+        print(f"Warning: Could not cast model to dtype {dtype}: {e}")
     return model
 
 

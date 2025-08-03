@@ -46,25 +46,8 @@ class WanTI2V:
         self.vae = Wan2_2_VAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
         )
-        # Create WanModel with proper configuration
-        self.model = WanModel(
-            patch_size=config.patch_size,
-            text_len=config.text_len,
-            in_dim=48,  # Based on checkpoint structure
-            dim=config.dim,
-            ffn_dim=config.ffn_dim,
-            freq_dim=config.freq_dim,
-            text_dim=4096,
-            out_dim=48,  # Based on checkpoint structure
-            num_heads=config.num_heads,
-            num_layers=config.num_layers,
-            window_size=config.window_size,
-            qk_norm=config.qk_norm,
-            cross_attn_norm=config.cross_attn_norm,
-            eps=config.eps
-        )
-        # Load weights
-        self.model.load_weights(os.path.join(checkpoint_dir, "wan_model_mlx.safetensors"))
+        # Load model using from_pretrained method that handles parameter mapping
+        self.model = WanModel.from_pretrained(checkpoint_dir, "wan_model_mlx.safetensors", model_type='ti2v')
 
         self.sample_neg_prompt = config.sample_neg_prompt
 

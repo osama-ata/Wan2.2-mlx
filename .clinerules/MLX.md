@@ -16,7 +16,7 @@ https://ml-explore.github.io/mlx/build/html/python/nn/_autosummary/mlx.nn.MultiH
 
 "uv run python inspect_model.py '/Applications/Data/Models/Wan2.2-TI2V-5B/Models/Converted/wan_model_mlx.safetensors"
 
-Models_Path: '/Applications/Data/Models/Wan2.2-TI2V-5B/Models/Converted'
+Models_Path: '/Applications/Data/Models/Wan2.2-TI2V-5B/src/converted_models'
 .
 ├── config.json
 ├── configuration.json

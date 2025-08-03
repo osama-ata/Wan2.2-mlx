@@ -142,24 +142,23 @@ class WanT2V:
         # MLX handles dtype conversion automatically
         return model
 
-        return model
-
     def _prepare_model_for_timestep(self, t, boundary, offload_model):
         r"""
         Prepares and returns the required model for the current timestep.
 
         Args:
-            t (torch.Tensor):
+            t (mlx.core.array):
                 current timestep.
             boundary (`int`):
                 The timestep threshold. If `t` is at or above this value,
                 the `high_noise_model` is considered as the required model.
             offload_model (`bool`):
                 A flag intended to control the offloading behavior.
+                Note: MLX uses unified memory so explicit offloading is not needed.
 
         Returns:
-            torch.nn.Module:
-                The active model on the target device for the current timestep.
+            mlx.nn.Module:
+                The active model for the current timestep.
         """
         if t.item() >= boundary:
             required_model_name = 'high_noise_model'
@@ -167,15 +166,12 @@ class WanT2V:
         else:
             required_model_name = 'low_noise_model'
             offload_model_name = 'high_noise_model'
-        if offload_model or self.init_on_cpu:
-            if next(getattr(
-                    self,
-                    offload_model_name).parameters()).device.type == 'cuda':
-                getattr(self, offload_model_name).to('cpu')
-            if next(getattr(
-                    self,
-                    required_model_name).parameters()).device.type == 'cpu':
-                getattr(self, required_model_name).to(self.device)
+        
+        # MLX uses unified memory architecture - no explicit device management needed
+        # if offload_model or self.init_on_cpu:
+        #     # Device placement not needed in MLX
+        #     pass
+            
         return getattr(self, required_model_name)
 
     def generate(self,
@@ -217,7 +213,7 @@ class WanT2V:
                 If True, offloads models to CPU during generation to save VRAM
 
         Returns:
-            torch.Tensor:
+            mlx.core.array:
                 Generated video frames tensor. Dimensions: (C, N H, W) where:
                 - C: Color channels (3 for RGB)
                 - N: Number of frames (81)
