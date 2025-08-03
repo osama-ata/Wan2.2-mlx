@@ -9,9 +9,8 @@ import types
 from contextlib import contextmanager
 from functools import partial
 
-import torch
-import torch.cuda.amp as amp
-import torch.distributed as dist
+import mlx.core as mx
+import numpy as np
 from tqdm import tqdm
 
 from .distributed.fsdp import shard_model
@@ -19,7 +18,7 @@ from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
-from .modules.vae2_1 import Wan2_1_VAE
+from .modules.vae2_2 import Wan2_2_VAE
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -69,7 +68,7 @@ class WanT2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        # MLX doesn't require explicit device management
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
@@ -82,20 +81,17 @@ class WanT2V:
         if t5_fsdp or dit_fsdp or use_sp:
             self.init_on_cpu = False
 
-        shard_fn = partial(shard_model, device_id=device_id)
+        # Remove distributed training shard_fn for MLX
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
-            device=torch.device('cpu'),
             checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
-            shard_fn=shard_fn if t5_fsdp else None)
+            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer))
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
-        self.vae = Wan2_1_VAE(
-            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
+        self.vae = Wan2_2_VAE(
+            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint))
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.low_noise_model = WanModel.from_pretrained(
@@ -104,7 +100,6 @@ class WanT2V:
             model=self.low_noise_model,
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype)
 
         self.high_noise_model = WanModel.from_pretrained(
@@ -113,7 +108,6 @@ class WanT2V:
             model=self.high_noise_model,
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype)
         if use_sp:
             self.sp_size = get_world_size()
@@ -122,47 +116,31 @@ class WanT2V:
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
-    def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
-                         convert_model_dtype):
+    def _configure_model(self, model, use_sp, dit_fsdp, convert_model_dtype):
         """
-        Configures a model object. This includes setting evaluation modes,
-        applying distributed parallel strategy, and handling device placement.
+        Configures a model object for MLX. This includes setting evaluation modes.
 
         Args:
-            model (torch.nn.Module):
+            model (nn.Module):
                 The model instance to configure.
             use_sp (`bool`):
-                Enable distribution strategy of sequence parallel.
+                Enable distribution strategy of sequence parallel (not supported in MLX).
             dit_fsdp (`bool`):
-                Enable FSDP sharding for DiT model.
-            shard_fn (callable):
-                The function to apply FSDP sharding.
+                Enable FSDP sharding for DiT model (not supported in MLX).
             convert_model_dtype (`bool`):
                 Convert DiT model parameters dtype to 'config.param_dtype'.
-                Only works without FSDP.
 
         Returns:
-            torch.nn.Module:
+            nn.Module:
                 The configured model.
         """
-        model.eval().requires_grad_(False)
+        # MLX models don't need explicit evaluation mode or gradient requirements
+        # Distributed training features are not applicable in MLX
+        if use_sp or dit_fsdp:
+            logging.warning("Distributed training features (SP/FSDP) are not supported in MLX.")
 
-        if use_sp:
-            for block in model.blocks:
-                block.self_attn.forward = types.MethodType(
-                    sp_attn_forward, block.self_attn)
-            model.forward = types.MethodType(sp_dit_forward, model)
-
-        if dist.is_initialized():
-            dist.barrier()
-
-        if dit_fsdp:
-            model = shard_fn(model)
-        else:
-            if convert_model_dtype:
-                model.to(self.param_dtype)
-            if not self.init_on_cpu:
-                model.to(self.device)
+        # MLX handles dtype conversion automatically
+        return model
 
         return model
 
@@ -261,30 +239,16 @@ class WanT2V:
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=self.device)
-        seed_g.manual_seed(seed)
+        # MLX uses numpy random seeding
+        np.random.seed(seed)
+        mx.random.seed(seed)
 
-        if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
-                self.text_encoder.model.cpu()
-        else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+        # Get text embeddings (no device management needed in MLX)
+        context = self.text_encoder([input_prompt])
+        context_null = self.text_encoder([n_prompt])
 
         noise = [
-            torch.randn(
-                target_shape[0],
-                target_shape[1],
-                target_shape[2],
-                target_shape[3],
-                dtype=torch.float32,
-                device=self.device,
-                generator=seed_g)
+            mx.random.normal(target_shape, dtype=mx.float32)
         ]
 
         @contextmanager
@@ -296,83 +260,72 @@ class WanT2V:
         no_sync_high_noise = getattr(self.high_noise_model, 'no_sync',
                                      noop_no_sync)
 
-        # evaluation mode
-        with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
-                torch.no_grad(),
-                no_sync_low_noise(),
-                no_sync_high_noise(),
-        ):
-            boundary = self.boundary * self.num_train_timesteps
+        # MLX doesn't need context managers for evaluation mode
+        boundary = self.boundary * self.num_train_timesteps
 
-            if sample_solver == 'unipc':
-                sample_scheduler = FlowUniPCMultistepScheduler(
-                    num_train_timesteps=self.num_train_timesteps,
-                    shift=1,
-                    use_dynamic_shifting=False)
-                sample_scheduler.set_timesteps(
-                    sampling_steps, device=self.device, shift=shift)
-                timesteps = sample_scheduler.timesteps
-            elif sample_solver == 'dpm++':
-                sample_scheduler = FlowDPMSolverMultistepScheduler(
-                    num_train_timesteps=self.num_train_timesteps,
-                    shift=1,
-                    use_dynamic_shifting=False)
-                sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
-                timesteps, _ = retrieve_timesteps(
-                    sample_scheduler,
-                    device=self.device,
-                    sigmas=sampling_sigmas)
-            else:
-                raise NotImplementedError("Unsupported solver.")
+        if sample_solver == 'unipc':
+            sample_scheduler = FlowUniPCMultistepScheduler(
+                num_train_timesteps=self.num_train_timesteps,
+                shift=1,
+                use_dynamic_shifting=False)
+            sample_scheduler.set_timesteps(
+                sampling_steps, shift=shift)
+            timesteps = sample_scheduler.timesteps
+        elif sample_solver == 'dpm++':
+            sample_scheduler = FlowDPMSolverMultistepScheduler(
+                num_train_timesteps=self.num_train_timesteps,
+                shift=1,
+                use_dynamic_shifting=False)
+            sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+            timesteps, _ = retrieve_timesteps(
+                sample_scheduler,
+                sigmas=sampling_sigmas)
+        else:
+            raise NotImplementedError("Unsupported solver.")
 
-            # sample videos
-            latents = noise
+        # sample videos
+        latents = noise
 
-            arg_c = {'context': context, 'seq_len': seq_len}
-            arg_null = {'context': context_null, 'seq_len': seq_len}
+        arg_c = {'context': context, 'seq_len': seq_len}
+        arg_null = {'context': context_null, 'seq_len': seq_len}
 
-            for _, t in enumerate(tqdm(timesteps)):
-                latent_model_input = latents
-                timestep = [t]
+        for _, t in enumerate(tqdm(timesteps)):
+            latent_model_input = latents
+            timestep = [t]
 
-                timestep = torch.stack(timestep)
+            timestep = mx.stack(timestep)
 
-                model = self._prepare_model_for_timestep(
-                    t, boundary, offload_model)
-                sample_guide_scale = guide_scale[1] if t.item(
-                ) >= boundary else guide_scale[0]
+            model = self._prepare_model_for_timestep(
+                t, boundary, offload_model)
+            sample_guide_scale = guide_scale[1] if t.item(
+            ) >= boundary else guide_scale[0]
 
-                noise_pred_cond = model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+            noise_pred_cond = model(
+                latent_model_input, t=timestep, **arg_c)[0]
+            noise_pred_uncond = model(
+                latent_model_input, t=timestep, **arg_null)[0]
 
-                noise_pred = noise_pred_uncond + sample_guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+            noise_pred = noise_pred_uncond + sample_guide_scale * (
+                noise_pred_cond - noise_pred_uncond)
 
-                temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0),
-                    t,
-                    latents[0].unsqueeze(0),
-                    return_dict=False,
-                    generator=seed_g)[0]
-                latents = [temp_x0.squeeze(0)]
+            temp_x0 = sample_scheduler.step(
+                mx.expand_dims(noise_pred, 0),
+                t,
+                mx.expand_dims(latents[0], 0),
+                return_dict=False)[0]
+            latents = [mx.squeeze(temp_x0, 0)]
 
-            x0 = latents
-            if offload_model:
-                self.low_noise_model.cpu()
-                self.high_noise_model.cpu()
-                torch.cuda.empty_cache()
-            if self.rank == 0:
-                videos = self.vae.decode(x0)
+        x0 = latents
+        if offload_model:
+            # MLX doesn't need explicit model offloading
+            pass
+        if self.rank == 0:
+            videos = self.vae.decode(x0)
 
         del noise, latents
         del sample_scheduler
         if offload_model:
             gc.collect()
-            torch.cuda.synchronize()
-        if dist.is_initialized():
-            dist.barrier()
-
+            # MLX doesn't need cuda synchronize
+        
         return videos[0] if self.rank == 0 else None

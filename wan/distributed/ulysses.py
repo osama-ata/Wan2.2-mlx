@@ -1,9 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
-import torch
-import torch.distributed as dist
+import mlx.core as mx
 
-from ..modules.attention import flash_attention
-from .util import all_to_all
+from ..modules.attention import attention
 
 
 def distributed_attention(
@@ -14,34 +12,27 @@ def distributed_attention(
         window_size=(-1, -1),
 ):
     """
-    Performs distributed attention based on DeepSpeed Ulysses attention mechanism.
+    Performs attention using MLX. The distributed logic has been removed as
+    MLX is primarily used on single devices.
+    The original implementation was based on DeepSpeed Ulysses attention mechanism.
     please refer to https://arxiv.org/pdf/2309.14509
 
     Args:
-        q:           [B, Lq // p, Nq, C1].
-        k:           [B, Lk // p, Nk, C1].
-        v:           [B, Lk // p, Nk, C2]. Nq must be divisible by Nk.
+        q:           [B, Lq, Nq, C1].
+        k:           [B, Lk, Nk, C1].
+        v:           [B, Lk, Nk, C2].
         seq_lens:    [B], length of each sequence in batch
         window_size: (left right). If not (-1, -1), apply sliding window local attention.
     """
-    if not dist.is_initialized():
-        raise ValueError("distributed group should be initialized.")
-    b = q.shape[0]
-
-    # gather q/k/v sequence
-    q = all_to_all(q, scatter_dim=2, gather_dim=1)
-    k = all_to_all(k, scatter_dim=2, gather_dim=1)
-    v = all_to_all(v, scatter_dim=2, gather_dim=1)
-
-    # apply attention
-    x = flash_attention(
+    # The original implementation used torch.distributed for sequence parallelism.
+    # Since MLX is primarily for single-device (Apple Silicon), we remove the
+    # distributed logic and just perform standard attention.
+    # The `attention` function from `wan.modules.attention` is already
+    # using MLX's scaled_dot_product_attention.
+    return attention(
         q,
         k,
         v,
         k_lens=seq_lens,
         window_size=window_size,
     )
-
-    # scatter q/k/v sequence
-    x = all_to_all(x, scatter_dim=1, gather_dim=2)
-    return x

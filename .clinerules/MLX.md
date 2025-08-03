@@ -1,17 +1,46 @@
-
+---
+applyTo: '**'
+---
 ### **Project Mandate: Full Codebase Migration from PyTorch to MLX**
 
 Objective:  
 Refactor the entire project codebase, migrating it from the PyTorch framework to Apple's MLX framework. The goal is to create a pure MLX-native implementation that leverages the unified memory architecture of Apple silicon for efficient model training and deployment. This project requires the complete removal of all PyTorch dependencies.
 
+Use MLX attention instead of flash attention
 
+https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fast.scaled_dot_product_attention.html
+
+https://ml-explore.github.io/mlx/build/html/python/nn/_autosummary/mlx.nn.MultiHeadAttention.html
+
+---
+
+"uv run python inspect_model.py '/Applications/Data/Models/Wan2.2-TI2V-5B/Models/Converted/wan_model_mlx.safetensors"
+
+Models_Path: '/Applications/Data/Models/Wan2.2-TI2V-5B/Models/Converted'
+.
+├── config.json
+├── configuration.json
+├── google
+│   └── umt5-xxl
+│       ├── special_tokens_map.json
+│       ├── spiece.model
+│       ├── tokenizer.json
+│       └── tokenizer_config.json
+├── t5_encoder_mlx.safetensors
+├── vae_mlx.safetensors
+├── wan_model_mlx.safetensors
+└── wan_model_mlx.safetensors.index.json
 
 ### **Core Migration Tasks**
 
+
 #### **1\. Environment and Dependency Management**
 
-* **Remove PyTorch:** Purge torch, torchvision, and torchaudio from all dependency files (e.g., requirements.txt, environment.yml, pyproject.toml).  
-* **Install MLX:** Add the mlx library as a primary dependency.  
+* **Remove PyTorch:** Purge torch, torchvision, and torchaudio from all dependency files (e.g., requirements.txt, environment.yml, pyproject.toml).
+* **Install MLX:** Add the mlx library as a primary dependency in `pyproject.toml`.
+* **Switch to uv:** Use [uv](https://github.com/astral-sh/uv) for all dependency and environment management. The `requirements.txt` file is deprecated; use `pyproject.toml` and `uv` for all installs and scripts:
+  * To install dependencies: `uv pip install -e .`
+  * To run scripts: `uv run python generate.py -- --task ...`
 * **Verification:** Ensure the project environment is correctly configured and can import mlx without errors.
 
 #### **2\. API and Tensor Conversion**
@@ -74,7 +103,7 @@ Python
   * **Load:** model.load\_weights("model.safetensors")  
 * **Inference Scripts:** Update all evaluation and inference scripts to use the new MLX model and weight-loading logic.
 
-
+---
 
 ### **Acceptance Criteria**
 
@@ -86,7 +115,7 @@ The migration is considered complete and successful when:
 * ✅ **Tests Pass:** All unit and integration tests are refactored for MLX and pass successfully.  
 * ✅ **Clean Code:** The final code is well-documented, readable, and clearly reflects the new MLX patterns.
 
-
+---
 
 ### **Resources**
 

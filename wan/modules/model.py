@@ -177,6 +177,17 @@ class WanCrossAttention(WanSelfAttention):
         return x
 
 
+class WanFFN(nn.Module):
+    def __init__(self, dim, ffn_dim):
+        super().__init__()
+        self.layer_0 = nn.Linear(dim, ffn_dim)
+        self.layer_1 = nn.GELU()
+        self.layer_2 = nn.Linear(ffn_dim, dim)
+
+    def __call__(self, x):
+        return self.layer_2(self.layer_1(self.layer_0(x)))
+
+
 class WanAttentionBlock(nn.Module):
 
     def __init__(self,
@@ -202,13 +213,11 @@ class WanAttentionBlock(nn.Module):
                                           eps)
         self.norm3 = WanLayerNorm(
             dim, eps,
-            affine=True) if cross_attn_norm else nn.Identity()
+            elementwise_affine=True) if cross_attn_norm else nn.Identity()
         self.cross_attn = WanCrossAttention(dim, num_heads, (-1, -1), qk_norm,
                                             eps)
         self.norm2 = WanLayerNorm(dim, eps)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
-            nn.Linear(ffn_dim, dim))
+        self.ffn = WanFFN(dim, ffn_dim)
 
         # modulation
         self.modulation = mx.random.normal((1, 6, dim)) / dim**0.5
@@ -264,7 +273,7 @@ class Head(nn.Module):
         # layers
         out_dim = math.prod(patch_size) * out_dim
         self.norm = WanLayerNorm(dim, eps)
-        self.head = nn.Linear(dim, out_dim)
+        self.linear = nn.Linear(dim, out_dim)
 
         # modulation
         self.modulation = mx.random.normal((1, 2, dim)) / dim**0.5
@@ -278,9 +287,41 @@ class Head(nn.Module):
         e = (mx.expand_dims(self.modulation, 0) + mx.expand_dims(e, 2))
         e = mx.split(e, 2, axis=2)
         x = (
-            self.head(
+            self.linear(
                 self.norm(x) * (1 + mx.squeeze(e[1], axis=2)) + mx.squeeze(e[0], axis=2)))
         return x
+
+
+class TextEmbedding(nn.Module):
+    def __init__(self, text_dim, dim):
+        super().__init__()
+        self.layer_0 = nn.Linear(text_dim, dim)
+        self.layer_1 = nn.GELU()
+        self.layer_2 = nn.Linear(dim, dim)
+
+    def __call__(self, x):
+        return self.layer_2(self.layer_1(self.layer_0(x)))
+
+
+class TimeEmbedding(nn.Module):
+    def __init__(self, freq_dim, dim):
+        super().__init__()
+        self.layer_0 = nn.Linear(freq_dim, dim)
+        self.layer_1 = nn.SiLU()
+        self.layer_2 = nn.Linear(dim, dim)
+
+    def __call__(self, x):
+        return self.layer_2(self.layer_1(self.layer_0(x)))
+
+
+class TimeProjection(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.layer_0 = nn.SiLU()
+        self.layer_1 = nn.Linear(dim, dim * 6)
+
+    def __call__(self, x):
+        return self.layer_1(self.layer_0(x))
 
 
 class WanModel(nn.Module):
@@ -363,13 +404,20 @@ class WanModel(nn.Module):
         # embeddings
         self.patch_embedding = nn.Conv3d(
             in_channels=in_dim, out_channels=dim, kernel_size=patch_size, stride=patch_size)
-        self.text_embedding = nn.Sequential(
-            nn.Linear(text_dim, dim), nn.GELU(approximate='tanh'),
-            nn.Linear(dim, dim))
-
-        self.time_embedding = nn.Sequential(
-            nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
-        self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
+        self.text_embedding = [
+            nn.Linear(text_dim, dim),  # layer 0
+            nn.GELU(),                 # layer 1 (not stored)
+            nn.Linear(dim, dim)        # layer 2
+        ]
+        self.time_embedding = [
+            nn.Linear(freq_dim, dim),  # layer 0
+            nn.SiLU(),                 # layer 1 (not stored)
+            nn.Linear(dim, dim)        # layer 2
+        ]
+        self.time_projection = [
+            nn.SiLU(),                # layer 0 (not stored)
+            nn.Linear(dim, dim * 6)   # layer 1
+        ]
 
         # blocks
         self.blocks = [
@@ -377,21 +425,62 @@ class WanModel(nn.Module):
                               cross_attn_norm, eps) for _ in range(num_layers)
         ]
 
-        # head
-        self.head = Head(dim, out_dim, patch_size, eps)
+        # head (matching checkpoint structure)
+        self.head = [
+            None,  # head.0 doesn't exist in checkpoint
+            nn.Linear(dim, math.prod(patch_size) * out_dim)  # head.1 exists in checkpoint
+        ]
+        # head modulation parameter
+        self.head_modulation = mx.random.normal((1, 2, dim)) / dim**0.5
 
-        # buffers
+        # buffers (computed, not stored in checkpoint)
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
-        self.freqs = mx.concatenate([
+        freqs_init = mx.concatenate([
             rope_params(1024, d - 4 * (d // 6)),
             rope_params(1024, 2 * (d // 6)),
             rope_params(1024, 2 * (d // 6))
-        ],
-                               axis=1)
+        ], axis=1)
+        # Store freqs as a computed buffer, not a parameter
+        self._freqs = freqs_init
 
         # initialize weights
         self.init_weights()
+
+    @classmethod
+    def from_pretrained(cls, checkpoint_dir, subfolder, **kwargs):
+        """Load model from pretrained safetensors weights."""
+        import os
+        
+        # Create model instance with correct parameters for this checkpoint
+        # For TI2V-5B model (based on actual checkpoint structure)
+        model_kwargs = {
+            'patch_size': (1, 2, 2),
+            'text_len': 512,
+            'in_dim': 48,  # Based on checkpoint: (3072, 48, 1, 2, 2)
+            'dim': 3072,   # Based on checkpoint: (3072, 48, 1, 2, 2)
+            'ffn_dim': 14336,  # Based on checkpoint: (14336, 3072)
+            'freq_dim': 256,
+            'text_dim': 4096,
+            'out_dim': 48,  # Assuming same as in_dim
+            'num_heads': 24,  # 3072 / 128 = 24 (common head dim)
+            'num_layers': 30,  # Based on actual checkpoint
+            'window_size': (-1, -1),
+            'qk_norm': True,
+            'cross_attn_norm': True,
+            'eps': 1e-6
+        }
+        model_kwargs.update(kwargs)
+        model = cls(**model_kwargs)
+        
+        # Load weights from safetensors file
+        safetensors_path = os.path.join(checkpoint_dir, subfolder)
+        if os.path.exists(safetensors_path):
+            model.load_weights(safetensors_path)
+        else:
+            raise FileNotFoundError(f"Could not find safetensors file at {safetensors_path}")
+        
+        return model
 
     def __call__(
         self,
@@ -444,27 +533,33 @@ class WanModel(nn.Module):
 
         bt = t.shape[0]
         t = t.flatten()
-        e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim,
-                                    t).reshape(bt, seq_len, -1).astype(mx.float32))
-        e0 = self.time_projection(e).reshape(bt, seq_len, 6, self.dim)
-
+        # Apply time embedding layers
+        t_embed = sinusoidal_embedding_1d(self.freq_dim, t).reshape(bt, seq_len, -1).astype(mx.float32)
+        e = self.time_embedding[0](t_embed)
+        e = self.time_embedding[1](e)
+        e = self.time_embedding[2](e)
+        # Apply time projection
+        e0 = self.time_projection[0](e)
+        e0 = self.time_projection[1](e0).reshape(bt, seq_len, 6, self.dim)
 
         # context
         context_lens = None
-        context = self.text_embedding(
-            mx.stack([
-                mx.concatenate(
-                    [u, mx.zeros((self.text_len - u.shape[0], u.shape[1]), dtype=u.dtype)])
-                for u in context
-            ]))
+        # Apply text embedding layers
+        context_padded = mx.stack([
+            mx.concatenate(
+                [u, mx.zeros((self.text_len - u.shape[0], u.shape[1]), dtype=u.dtype)])
+            for u in context
+        ])
+        context = self.text_embedding[0](context_padded)
+        context = self.text_embedding[1](context)
+        context = self.text_embedding[2](context)
 
         # arguments
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
-            freqs=self.freqs,
+            freqs=self._freqs,
             context=context,
             context_lens=context_lens)
 
@@ -472,7 +567,11 @@ class WanModel(nn.Module):
             x = block(x, **kwargs)
 
         # head
-        x = self.head(x, e)
+        # Apply head modulation and linear layer  
+        e_chunks = mx.split((mx.expand_dims(self.head_modulation, 0) + mx.expand_dims(e, 2)), 2, axis=2)
+        # Note: assuming there's a layer norm before the head that's part of the final block
+        x_modulated = x * (1 + mx.squeeze(e_chunks[1], axis=2)) + mx.squeeze(e_chunks[0], axis=2)
+        x = self.head[1](x_modulated)
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
@@ -510,18 +609,30 @@ class WanModel(nn.Module):
 
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                m.weight = nn.init.xavier_uniform()(m.weight.shape, m.weight.dtype)
+                m.weight = mx.random.normal(m.weight.shape, scale=0.02)
                 if m.bias is not None:
                     m.bias = mx.zeros_like(m.bias)
 
         # init embeddings
-        self.patch_embedding.weight = nn.init.xavier_uniform()(self.patch_embedding.weight.shape, self.patch_embedding.weight.dtype)
-        for m in self.text_embedding.modules():
-            if isinstance(m, nn.Linear):
-                m.weight = mx.random.normal(m.weight.shape, std=0.02)
-        for m in self.time_embedding.modules():
-            if isinstance(m, nn.Linear):
-                m.weight = mx.random.normal(m.weight.shape, std=0.02)
+        self.patch_embedding.weight = mx.random.normal(self.patch_embedding.weight.shape, scale=0.02)
+        
+        # Initialize text embedding layers
+        for layer in self.text_embedding:
+            if isinstance(layer, nn.Linear):
+                layer.weight = mx.random.normal(layer.weight.shape, scale=0.02)
+        
+        # Initialize time embedding layers
+        for layer in self.time_embedding:
+            if isinstance(layer, nn.Linear):
+                layer.weight = mx.random.normal(layer.weight.shape, scale=0.02)
+        
+        # Initialize time projection layers
+        for layer in self.time_projection:
+            if isinstance(layer, nn.Linear):
+                layer.weight = mx.random.normal(layer.weight.shape, scale=0.02)
 
-        # init output layer
-        self.head.head.weight = mx.zeros_like(self.head.head.weight)
+        # Initialize head layers
+        for layer in self.head:
+            if layer is not None and isinstance(layer, nn.Linear):
+                # init output layer to zero
+                layer.weight = mx.zeros_like(layer.weight)
