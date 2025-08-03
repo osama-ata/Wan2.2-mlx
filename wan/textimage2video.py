@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
-from .modules.vae2_2 import Wan2_2_VAE
+from .modules.vae_simple import Wan2_1_VAE
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -43,7 +43,7 @@ class WanTI2V:
             tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
         )
 
-        self.vae = Wan2_2_VAE(
+        self.vae = Wan2_1_VAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
         )
         # Load model using from_pretrained method that handles parameter mapping
@@ -136,6 +136,13 @@ class WanTI2V:
             )
             sample_scheduler.set_timesteps(sampling_steps, shift=shift)
             timesteps = sample_scheduler.timesteps
+        elif sample_solver == "dpm++":
+            from .utils.fm_solvers import FlowDPMSolverMultistepScheduler
+            sample_scheduler = FlowDPMSolverMultistepScheduler(
+                num_train_timesteps=self.config.num_train_timesteps
+            )
+            sample_scheduler.set_timesteps(sampling_steps)
+            timesteps = sample_scheduler.timesteps
         else:
             raise NotImplementedError("Unsupported solver.")
 
@@ -214,6 +221,13 @@ class WanTI2V:
             )
             sample_scheduler.set_timesteps(sampling_steps, shift=shift)
             timesteps = sample_scheduler.timesteps
+        elif sample_solver == "dpm++":
+            from .utils.fm_solvers import FlowDPMSolverMultistepScheduler
+            sample_scheduler = FlowDPMSolverMultistepScheduler(
+                num_train_timesteps=self.config.num_train_timesteps
+            )
+            sample_scheduler.set_timesteps(sampling_steps)
+            timesteps = sample_scheduler.timesteps
         else:
             raise NotImplementedError("Unsupported solver.")
 
@@ -228,7 +242,8 @@ class WanTI2V:
             noise_pred = noise_pred_uncond + guide_scale * (
                 noise_pred_cond - noise_pred_uncond
             )
-            latent = sample_scheduler.step(noise_pred, t, latent)
+            latent_output = sample_scheduler.step(noise_pred, t, latent)
+            latent = latent_output.prev_sample if hasattr(latent_output, 'prev_sample') else latent_output
             latent = (1.0 - mask2) * z[0] + mask2 * latent
 
         videos = self.vae.decode([latent])

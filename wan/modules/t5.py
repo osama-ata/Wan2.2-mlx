@@ -259,7 +259,7 @@ class T5RelativeEmbedding(nn.Module):
                                      math.log(self.max_dist / max_exact) *
                                      (num_buckets - max_exact)).astype(mx.int64)
         rel_pos_large = mx.minimum(
-            rel_pos_large, mx.full_like(rel_pos_large, num_buckets - 1))
+            rel_pos_large, mx.full(rel_pos_large.shape, num_buckets - 1, dtype=rel_pos_large.dtype))
         rel_buckets += mx.where(rel_pos < max_exact, rel_pos, rel_pos_large)
         return rel_buckets
 
