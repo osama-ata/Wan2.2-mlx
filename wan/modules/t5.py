@@ -428,7 +428,7 @@ def _t5(name,
 
     # init model
     model = model_cls(**kwargs)
-    model.to(dtype)
+    _cast_model_dtype(model, dtype)
 
     # init tokenizer
     if return_tokenizer:
