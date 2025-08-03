@@ -1,133 +1,11 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
-import torch
-
-try:
-    import flash_attn_interface
-    FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_3_AVAILABLE = False
-
-try:
-    import flash_attn
-    FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_2_AVAILABLE = False
-
+import mlx.core as mx
+import mlx.nn as nn
 import warnings
 
 __all__ = [
-    'flash_attention',
     'attention',
 ]
-
-
-def flash_attention(
-    q,
-    k,
-    v,
-    q_lens=None,
-    k_lens=None,
-    dropout_p=0.,
-    softmax_scale=None,
-    q_scale=None,
-    causal=False,
-    window_size=(-1, -1),
-    deterministic=False,
-    dtype=torch.bfloat16,
-    version=None,
-):
-    """
-    q:              [B, Lq, Nq, C1].
-    k:              [B, Lk, Nk, C1].
-    v:              [B, Lk, Nk, C2]. Nq must be divisible by Nk.
-    q_lens:         [B].
-    k_lens:         [B].
-    dropout_p:      float. Dropout probability.
-    softmax_scale:  float. The scaling of QK^T before applying softmax.
-    causal:         bool. Whether to apply causal attention mask.
-    window_size:    (left right). If not (-1, -1), apply sliding window local attention.
-    deterministic:  bool. If True, slightly slower and uses more memory.
-    dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
-    """
-    half_dtypes = (torch.float16, torch.bfloat16)
-    assert dtype in half_dtypes
-    assert q.device.type == 'cuda' and q.size(-1) <= 256
-
-    # params
-    b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
-
-    def half(x):
-        return x if x.dtype in half_dtypes else x.to(dtype)
-
-    # preprocess query
-    if q_lens is None:
-        q = half(q.flatten(0, 1))
-        q_lens = torch.tensor(
-            [lq] * b, dtype=torch.int32).to(
-                device=q.device, non_blocking=True)
-    else:
-        q = half(torch.cat([u[:v] for u, v in zip(q, q_lens)]))
-
-    # preprocess key, value
-    if k_lens is None:
-        k = half(k.flatten(0, 1))
-        v = half(v.flatten(0, 1))
-        k_lens = torch.tensor(
-            [lk] * b, dtype=torch.int32).to(
-                device=k.device, non_blocking=True)
-    else:
-        k = half(torch.cat([u[:v] for u, v in zip(k, k_lens)]))
-        v = half(torch.cat([u[:v] for u, v in zip(v, k_lens)]))
-
-    q = q.to(v.dtype)
-    k = k.to(v.dtype)
-
-    if q_scale is not None:
-        q = q * q_scale
-
-    if version is not None and version == 3 and not FLASH_ATTN_3_AVAILABLE:
-        warnings.warn(
-            'Flash attention 3 is not available, use flash attention 2 instead.'
-        )
-
-    # apply attention
-    if (version is None or version == 3) and FLASH_ATTN_3_AVAILABLE:
-        # Note: dropout_p, window_size are not supported in FA3 now.
-        x = flash_attn_interface.flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            seqused_q=None,
-            seqused_k=None,
-            max_seqlen_q=lq,
-            max_seqlen_k=lk,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            deterministic=deterministic)[0].unflatten(0, (b, lq))
-    else:
-        assert FLASH_ATTN_2_AVAILABLE
-        x = flash_attn.flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            max_seqlen_q=lq,
-            max_seqlen_k=lk,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            deterministic=deterministic).unflatten(0, (b, lq))
-
-    # output
-    return x.type(out_dtype)
 
 
 def attention(
@@ -142,38 +20,69 @@ def attention(
     causal=False,
     window_size=(-1, -1),
     deterministic=False,
-    dtype=torch.bfloat16,
+    dtype=mx.bfloat16,
     fa_version=None,
 ):
-    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
-        return flash_attention(
-            q=q,
-            k=k,
-            v=v,
-            q_lens=q_lens,
-            k_lens=k_lens,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            q_scale=q_scale,
-            causal=causal,
-            window_size=window_size,
-            deterministic=deterministic,
-            dtype=dtype,
-            version=fa_version,
+    if q_lens is not None or k_lens is not None:
+        warnings.warn(
+            'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
         )
+    
+    if window_size != (-1, -1):
+        warnings.warn(
+            'Sliding window local attention is not supported in this implementation.'
+        )
+
+    if fa_version is not None:
+        warnings.warn(
+            'Flash attention version selection is not supported. Using default MLX attention.'
+        )
+
+    if deterministic:
+        warnings.warn(
+            'Deterministic mode is not explicitly supported in MLX attention. Behavior may differ.'
+        )
+
+    if q_scale is not None:
+        q = q * q_scale
+
+    q = q.astype(dtype)
+    k = k.astype(dtype)
+    v = v.astype(dtype)
+
+    # MLX scaled_dot_product_attention expects [B, num_heads, L, C]
+    # The input is [B, L, num_heads, C], so we need to transpose
+    q = q.transpose(0, 2, 1, 3)
+    k = k.transpose(0, 2, 1, 3)
+    v = v.transpose(0, 2, 1, 3)
+
+    # Create mask for causal attention
+    mask = None
+    if causal:
+        # MLX's scaled_dot_product_attention handles causal masking internally when `is_causal=True` is not available.
+        # We can create a causal mask manually.
+        score = (q @ k.transpose(0, 1, 3, 2)) * (1.0 / mx.sqrt(q.shape[-1]))
+        if softmax_scale is not None:
+            score = score * softmax_scale
+        
+        l = q.shape[2]
+        causal_mask = nn.MultiHeadAttention.create_additive_causal_mask(l)
+        score = score + causal_mask
+        score = mx.softmax(score, axis=-1)
+        if dropout_p > 0.0:
+            score = nn.Dropout(p=dropout_p)(score)
+        
+        out = score @ v
     else:
-        if q_lens is not None or k_lens is not None:
-            warnings.warn(
-                'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
-            )
-        attn_mask = None
+        # Manual implementation of scaled dot-product attention for non-causal case
+        score = (q @ k.transpose(0, 1, 3, 2)) * (1.0 / mx.sqrt(q.shape[-1]))
+        if softmax_scale is not None:
+            score = score * softmax_scale
+        score = mx.softmax(score, axis=-1)
+        if dropout_p > 0.0:
+            score = nn.Dropout(p=dropout_p)(score)
+        out = score @ v
 
-        q = q.transpose(1, 2).to(dtype)
-        k = k.transpose(1, 2).to(dtype)
-        v = v.transpose(1, 2).to(dtype)
-
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
-
-        out = out.transpose(1, 2).contiguous()
-        return out
+    # Transpose back to [B, L, num_heads, C]
+    out = out.transpose(0, 2, 1, 3)
+    return out

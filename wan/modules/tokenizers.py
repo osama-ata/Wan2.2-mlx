@@ -50,7 +50,7 @@ class HuggingfaceTokenizer:
         return_mask = kwargs.pop('return_mask', False)
 
         # arguments
-        _kwargs = {'return_tensors': 'pt'}
+        _kwargs = {'return_tensors': 'np'}
         if self.seq_len is not None:
             _kwargs.update({
                 'padding': 'max_length',
