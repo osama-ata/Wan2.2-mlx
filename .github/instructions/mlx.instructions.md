@@ -8,6 +8,8 @@ applyTo: '**'
 ```bash
 uv run python inspect_model.py '/Applications/Data/Models/Wan2.2-TI2V-5B/src/converted_models/wan_model_mlx.safetensors'
 ```
+## Running Script
+uv run python generate.py --task ti2v-5B --ckpt_dir '/Applications/Data/Models/Wan2.2-TI2V-5B/src/converted_models' --prompt "A golden retriever in a sunflower field at sunset" --image "examples/i2v_input.JPG" --size "1280*704" --base_seed 42 --sample_solver "dpm++" --sample_steps 10
 
 **Models Path:** `/Applications/Data/Models/Wan2.2-TI2V-5B/src/converted_models`
 ```

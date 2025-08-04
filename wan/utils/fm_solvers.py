@@ -223,8 +223,15 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         # Convert model output  
         model_output = self.convert_model_output(model_output, timestep, sample)
         
-        # Store model output for multi-step methods
-        self.model_outputs[self.lower_order_nums] = model_output
+        # Store model output for multi-step methods  
+        # Ensure we don't exceed the list bounds
+        if self.lower_order_nums < len(self.model_outputs):
+            self.model_outputs[self.lower_order_nums] = model_output
+        else:
+            # If list is too small, extend it
+            while len(self.model_outputs) <= self.lower_order_nums:
+                self.model_outputs.append(None)
+            self.model_outputs[self.lower_order_nums] = model_output
         
         # Simple Euler step (can be extended to higher order DPM-Solver)
         if self._step_index < len(self.timesteps) - 1:

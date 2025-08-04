@@ -31,16 +31,40 @@ def save_video(
     value_range=(-1, 1),
 ):
     # Ensure tensor is on the CPU and convert to numpy
+    logging.info(f"💾 Starting video save process...")
+    logging.info(f"📊 Input tensor shape: {tensor.shape}, dtype: {tensor.dtype}")
+    logging.info(f"⚙️  Save parameters - FPS: {fps}, Normalize: {normalize}, Value range: {value_range}")
+    
     tensor_np = np.array(tensor, copy=False)
+    
+    # Debug: Print tensor shape information
+    print(f"DEBUG save_video: Original tensor shape: {tensor.shape}")
+    print(f"DEBUG save_video: Numpy array shape: {tensor_np.shape}")
+    print(f"DEBUG save_video: Numpy array ndim: {tensor_np.ndim}")
 
     # Clamp and normalize
+    logging.debug("🔧 Applying clamping and normalization...")
     tensor_np = np.clip(tensor_np, value_range[0], value_range[1])
     if normalize:
         tensor_np = (tensor_np - value_range[0]) / (value_range[1] - value_range[0])
+        logging.debug(f"📊 After normalization - Min: {tensor_np.min():.4f}, Max: {tensor_np.max():.4f}")
+
+    # Handle different tensor formats
+    if tensor_np.ndim == 4:
+        # If 4D, assume it's (B, C, H, W) - single frame or missing time dimension
+        print("DEBUG save_video: Detected 4D tensor, adding time dimension")
+        logging.warning("⚠️  4D tensor detected, adding time dimension")
+        tensor_np = np.expand_dims(tensor_np, axis=2)  # Add time dimension
+    elif tensor_np.ndim != 5:
+        raise ValueError(f"Expected 4D or 5D tensor, got {tensor_np.ndim}D tensor with shape {tensor_np.shape}")
 
     # Create a grid for each time step
     grid_frames = []
+    print(f"DEBUG save_video: Processing {tensor_np.shape[2]} frames")
+    logging.info(f"🎬 Processing {tensor_np.shape[2]} frames for video creation...")
     for t in range(tensor_np.shape[2]):
+        if t % 10 == 0:
+            logging.debug(f"🎞️  Processing frame {t+1}/{tensor_np.shape[2]}")
         frame_data = tensor_np[:, :, t, :, :]
         # Implement make_grid functionality with numpy
         # This is a simplified version. For a more robust implementation,
@@ -63,23 +87,34 @@ def save_video(
         grid_frames.append(grid)
 
     # Stack frames and permute
+    logging.debug("🔄 Stacking frames and converting format...")
     video_grid = np.stack(grid_frames, axis=0)  # T, C, H, W
     video_grid = np.transpose(video_grid, (0, 2, 3, 1))  # T, H, W, C
+    logging.debug(f"📊 Video grid shape after transpose: {video_grid.shape}")
 
     # Scale to 8-bit integer
+    logging.debug("🎨 Converting to 8-bit format...")
     video_grid = (video_grid * 255).astype(np.uint8)
+    logging.debug(f"📊 Final video stats - Min: {video_grid.min()}, Max: {video_grid.max()}")
 
     # Determine output file path
     output_file = save_file or osp.join("/tmp", rand_name(suffix=suffix))
+    logging.info(f"💾 Writing video to: {output_file}")
 
     # Write video
     try:
+        logging.debug(f"🎬 Starting video encoding with codec: libx264, fps: {fps}")
         writer = imageio.get_writer(output_file, fps=fps, codec="libx264", quality=8)
-        for frame in video_grid:
+        for i, frame in enumerate(video_grid):
+            if i % 20 == 0 or i == len(video_grid) - 1:
+                logging.debug(f"✍️  Writing frame {i+1}/{len(video_grid)}")
             writer.append_data(frame)
         writer.close()
+        logging.info(f"✅ Video saved successfully: {output_file}")
+        logging.info(f"📊 Final video: {len(video_grid)} frames, {video_grid[0].shape[1]}x{video_grid[0].shape[0]}")
     except Exception as e:
-        logging.info(f"save_video failed, error: {e}")
+        logging.error(f"❌ save_video failed, error: {e}")
+        raise
 
 
 def save_image(

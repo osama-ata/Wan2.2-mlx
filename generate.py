@@ -123,19 +123,27 @@ def _init_logging():
 
 def generate(args):
     _init_logging()
+    logging.info("🚀 Starting Wan2.2 MLX video generation...")
+    logging.info(f"🎲 Setting random seeds to: {args.base_seed}")
     mx.random.seed(args.base_seed)
     np.random.seed(args.base_seed)
     random.seed(args.base_seed)
+    logging.info(f"✅ Random seeds initialized")
 
     if args.use_prompt_extend:
+        logging.info("📝 Prompt extension enabled - initializing expander...")
         if args.prompt_extend_method == "dashscope":
+            logging.info(f"🔧 Using DashScope method with model: {args.prompt_extend_model}")
             prompt_expander = DashScopePromptExpander(model_name=args.prompt_extend_model, task=args.task, is_vl=args.image is not None)
         elif args.prompt_extend_method == "local_qwen":
+            logging.info(f"🔧 Using local Qwen method with model: {args.prompt_extend_model}")
             prompt_expander = QwenPromptExpander(model_name=args.prompt_extend_model, task=args.task, is_vl=args.image is not None, device=mx.gpu)
         else:
             raise NotImplementedError(f"Unsupport prompt_extend_method: {args.prompt_extend_method}")
+        logging.info("✅ Prompt expander initialized successfully")
 
     cfg = WAN_CONFIGS[args.task]
+    logging.info(f"📋 Loaded configuration for task: {args.task}")
 
     logging.info(f"Generation job args: {args}")
     logging.info(f"Generation model config: {cfg}")
@@ -143,23 +151,31 @@ def generate(args):
 
     img = None
     if args.image is not None:
+        logging.info(f"🖼️  Loading input image: {args.image}")
         img = Image.open(args.image).convert("RGB")
+        logging.info(f"✅ Image loaded successfully - Size: {img.size}, Mode: {img.mode}")
         logging.info(f"Input image: {args.image}")
+    else:
+        logging.info("📝 No input image provided - text-only generation")
 
     if args.use_prompt_extend:
-        logging.info("Extending prompt ...")
+        logging.info("🔄 Extending prompt ...")
         prompt_output = prompt_expander(args.prompt, image=img, tar_lang=args.prompt_extend_target_lang, seed=args.base_seed)
         if not prompt_output.status:
-            logging.info(f"Extending prompt failed: {prompt_output.message}")
-            logging.info("Falling back to original prompt.")
+            logging.warning(f"⚠️  Extending prompt failed: {prompt_output.message}")
+            logging.info("🔄 Falling back to original prompt.")
         else:
+            logging.info("✅ Prompt extended successfully")
             args.prompt = prompt_output.prompt
-        logging.info(f"Extended prompt: {args.prompt}")
+        logging.info(f"📝 Final prompt: {args.prompt}")
 
+    # Model loading and generation with detailed logging
     if "t2v" in args.task:
-        logging.info("Creating WanT2V pipeline.")
+        logging.info("🎬 Creating WanT2V pipeline...")
         wan_t2v = wan.WanT2V(config=cfg, checkpoint_dir=args.ckpt_dir, convert_model_dtype=args.convert_model_dtype)
-        logging.info("Generating video ...")
+        logging.info("✅ WanT2V pipeline created successfully")
+        logging.info(f"🎬 Generating video - Size: {SIZE_CONFIGS[args.size]}, Frames: {args.frame_num}")
+        logging.info(f"⚙️  Generation params - Solver: {args.sample_solver}, Steps: {args.sample_steps}, Shift: {args.sample_shift}, Guide Scale: {args.sample_guide_scale}")
         video = wan_t2v.generate(
             args.prompt,
             size=SIZE_CONFIGS[args.size],
@@ -171,9 +187,12 @@ def generate(args):
             seed=args.base_seed,
         )
     elif "ti2v" in args.task:
-        logging.info("Creating WanTI2V pipeline.")
+        logging.info("🎬 Creating WanTI2V pipeline...")
         wan_ti2v = wan.WanTI2V(config=cfg, checkpoint_dir=args.ckpt_dir, convert_model_dtype=args.convert_model_dtype)
-        logging.info("Generating video ...")
+        logging.info("✅ WanTI2V pipeline created successfully")
+        logging.info(f"🎬 Generating text+image-to-video - Size: {SIZE_CONFIGS[args.size]}, Frames: {args.frame_num}")
+        logging.info(f"📐 Max area: {MAX_AREA_CONFIGS[args.size]}")
+        logging.info(f"⚙️  Generation params - Solver: {args.sample_solver}, Steps: {args.sample_steps}, Shift: {args.sample_shift}, Guide Scale: {args.sample_guide_scale}")
         video = wan_ti2v.generate(
             args.prompt,
             img=img,
@@ -187,9 +206,11 @@ def generate(args):
             seed=args.base_seed,
         )
     else:
-        logging.info("Creating WanI2V pipeline.")
+        logging.info("🎬 Creating WanI2V pipeline...")
         wan_i2v = wan.WanI2V(config=cfg, checkpoint_dir=args.ckpt_dir, convert_model_dtype=args.convert_model_dtype)
-        logging.info("Generating video ...")
+        logging.info("✅ WanI2V pipeline created successfully")
+        logging.info(f"🎬 Generating image-to-video - Max area: {MAX_AREA_CONFIGS[args.size]}, Frames: {args.frame_num}")
+        logging.info(f"⚙️  Generation params - Solver: {args.sample_solver}, Steps: {args.sample_steps}, Shift: {args.sample_shift}, Guide Scale: {args.sample_guide_scale}")
         video = wan_i2v.generate(
             args.prompt,
             img,
@@ -202,16 +223,27 @@ def generate(args):
             seed=args.base_seed,
         )
 
+    logging.info("🔄 Evaluating generated video tensor...")
     mx.eval(video)
+    logging.info("✅ Video tensor evaluation completed")
+    
+    # Debug: Print video tensor shape
+    logging.info(f"📊 Generated video tensor shape: {video.shape}")
+    logging.info(f"📊 Video tensor stats - Min: {mx.min(video):.4f}, Max: {mx.max(video):.4f}, Mean: {mx.mean(video):.4f}")
 
     if args.save_file is None:
+        logging.info("🔧 Generating default save filename...")
         formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
         formatted_prompt = args.prompt.replace(" ", "_").replace("/", "_")[:50]
         suffix = ".mp4"
         args.save_file = f"{args.task}_{args.size.replace('*','x')}_{formatted_prompt}_{formatted_time}{suffix}"
+        logging.info(f"💾 Auto-generated filename: {args.save_file}")
 
-    logging.info(f"Saving generated video to {args.save_file}")
+    logging.info(f"💾 Saving generated video to: {args.save_file}")
     save_video(tensor=video, save_file=args.save_file, fps=cfg.sample_fps, nrow=1, normalize=True, value_range=(-1, 1))
+    logging.info("✅ Video saved successfully!")
+    logging.info("🎉 Generation completed!")
+    logging.info(f"📁 Output file: {args.save_file}")
     logging.info("Finished.")
 
 
