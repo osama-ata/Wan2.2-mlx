@@ -9,7 +9,57 @@ import imageio
 import numpy as np
 from mlx import core as mx
 
-__all__ = ["save_video", "save_image", "str2bool"]
+__all__ = ["save_video", "save_image", "str2bool", "masks_like", "best_output_size"]
+
+
+def _make_grid_mlx(tensor: mx.array, nrow: int = 8, padding: int = 2, normalize: bool = False, value_range: tuple = None):
+    """
+    Creates a grid of images from a batch of images.
+    MLX equivalent of torchvision.utils.make_grid.
+    """
+    if tensor.ndim == 3:  # (C, H, W) -> (1, C, H, W)
+        tensor = mx.expand_dims(tensor, 0)
+
+    # Handle 12-channel VAE output - convert to RGB
+    if tensor.shape[1] == 12:
+        logging.debug(f"🎨 Converting 12-channel VAE output to RGB in make_grid")
+        # Take first 3 channels as RGB
+        tensor = tensor[:, :3, :, :]
+    elif tensor.shape[1] > 4:
+        logging.warning(f"⚠️  Unexpected {tensor.shape[1]} channels, taking first 3 as RGB")
+        tensor = tensor[:, :3, :, :]
+
+    # Normalize if required
+    if normalize and value_range:
+        min_val, max_val = value_range
+        tensor = (tensor - min_val) / (max_val - min_val)
+        tensor = mx.clip(tensor, 0, 1)
+
+    num_images = tensor.shape[0]
+    num_cols = min(nrow, num_images)
+    num_rows = (num_images + num_cols - 1) // num_cols
+
+    c, h, w = tensor.shape[1], tensor.shape[2], tensor.shape[3]
+    grid_h = num_rows * h + padding * (num_rows - 1)
+    grid_w = num_cols * w + padding * (num_cols - 1)
+    
+    # Initialize grid with padding color (black)
+    grid = mx.zeros((c, grid_h, grid_w))
+
+    # Paste images into the grid
+    k = 0
+    for i in range(num_rows):
+        for j in range(num_cols):
+            if k < num_images:
+                y_start = i * (h + padding)
+                x_start = j * (w + padding)
+                grid = mx.index_update(
+                    grid,
+                    (slice(None), slice(y_start, y_start + h), slice(x_start, x_start + w)),
+                    tensor[k]
+                )
+            k += 1
+    return grid
 
 
 def rand_name(length=8, suffix=''):
@@ -30,88 +80,64 @@ def save_video(
     normalize: bool = True,
     value_range=(-1, 1),
 ):
-    # Ensure tensor is on the CPU and convert to numpy
+    """Saves a batch of video frames as a single video file."""
     logging.info(f"💾 Starting video save process...")
     logging.info(f"📊 Input tensor shape: {tensor.shape}, dtype: {tensor.dtype}")
     logging.info(f"⚙️  Save parameters - FPS: {fps}, Normalize: {normalize}, Value range: {value_range}")
     
-    tensor_np = np.array(tensor, copy=False)
-    
-    # Debug: Print tensor shape information
-    print(f"DEBUG save_video: Original tensor shape: {tensor.shape}")
-    print(f"DEBUG save_video: Numpy array shape: {tensor_np.shape}")
-    print(f"DEBUG save_video: Numpy array ndim: {tensor_np.ndim}")
-
-    # Clamp and normalize
-    logging.debug("🔧 Applying clamping and normalization...")
-    tensor_np = np.clip(tensor_np, value_range[0], value_range[1])
-    if normalize:
-        tensor_np = (tensor_np - value_range[0]) / (value_range[1] - value_range[0])
-        logging.debug(f"📊 After normalization - Min: {tensor_np.min():.4f}, Max: {tensor_np.max():.4f}")
-
-    # Handle different tensor formats
-    if tensor_np.ndim == 4:
-        # If 4D, assume it's (B, C, H, W) - single frame or missing time dimension
-        print("DEBUG save_video: Detected 4D tensor, adding time dimension")
-        logging.warning("⚠️  4D tensor detected, adding time dimension")
-        tensor_np = np.expand_dims(tensor_np, axis=2)  # Add time dimension
-    elif tensor_np.ndim != 5:
-        raise ValueError(f"Expected 4D or 5D tensor, got {tensor_np.ndim}D tensor with shape {tensor_np.shape}")
-
-    # Create a grid for each time step
-    grid_frames = []
-    print(f"DEBUG save_video: Processing {tensor_np.shape[2]} frames")
-    logging.info(f"🎬 Processing {tensor_np.shape[2]} frames for video creation...")
-    for t in range(tensor_np.shape[2]):
-        if t % 10 == 0:
-            logging.debug(f"🎞️  Processing frame {t+1}/{tensor_np.shape[2]}")
-        frame_data = tensor_np[:, :, t, :, :]
-        # Implement make_grid functionality with numpy
-        # This is a simplified version. For a more robust implementation,
-        # a dedicated grid-making function would be needed.
-        # This assumes the input is (B, C, H, W) for each frame
-        b, c, h, w = frame_data.shape
-        ncols = min(b, nrow)
-        nrows = (b + ncols - 1) // ncols
-        grid = np.zeros(
-            (c, h * nrows + (nrows - 1), w * ncols + (ncols - 1)), dtype=tensor_np.dtype
-        )
-        for i in range(b):
-            row = i // ncols
-            col = i % ncols
-            grid[
-                :,
-                row * (h + 1) : row * (h + 1) + h,
-                col * (w + 1) : col * (w + 1) + w,
-            ] = frame_data[i]
-        grid_frames.append(grid)
-
-    # Stack frames and permute
-    logging.debug("🔄 Stacking frames and converting format...")
-    video_grid = np.stack(grid_frames, axis=0)  # T, C, H, W
-    video_grid = np.transpose(video_grid, (0, 2, 3, 1))  # T, H, W, C
-    logging.debug(f"📊 Video grid shape after transpose: {video_grid.shape}")
-
-    # Scale to 8-bit integer
-    logging.debug("🎨 Converting to 8-bit format...")
-    video_grid = (video_grid * 255).astype(np.uint8)
-    logging.debug(f"📊 Final video stats - Min: {video_grid.min()}, Max: {video_grid.max()}")
-
     # Determine output file path
     output_file = save_file or osp.join("/tmp", rand_name(suffix=suffix))
     logging.info(f"💾 Writing video to: {output_file}")
-
-    # Write video
+    
     try:
+        # Preprocess - clamp values to range
+        tensor = mx.clip(tensor, min(value_range), max(value_range))
+        
+        # Handle different input formats
+        if tensor.ndim == 4:
+            # (B, C, H, W) -> (B, C, 1, H, W) - add time dimension
+            logging.warning("⚠️  4D tensor detected, adding time dimension")
+            tensor = mx.expand_dims(tensor, axis=2)
+        elif tensor.ndim != 5:
+            raise ValueError(f"Expected 4D or 5D tensor, got {tensor.ndim}D tensor with shape {tensor.shape}")
+        
+        # Input tensor shape: (B, C, T, H, W)
+        num_frames = tensor.shape[2]
+        logging.info(f"🎬 Processing {num_frames} frames for video creation...")
+        
+        frames = []
+        for i in range(num_frames):
+            if i % 10 == 0:
+                logging.debug(f"🎞️  Processing frame {i+1}/{num_frames}")
+            frame_batch = tensor[:, :, i, :, :]  # Shape: (B, C, H, W)
+            grid = _make_grid_mlx(frame_batch, nrow=nrow, normalize=normalize, value_range=value_range)
+            frames.append(grid)
+        
+        # Stack frames to create video tensor: (T, C, H_grid, W_grid)
+        video_tensor = mx.stack(frames, axis=0)
+        
+        # Transpose to (T, H_grid, W_grid, C) for imageio
+        video_tensor = video_tensor.transpose(0, 2, 3, 1)
+        
+        # Scale to 8-bit integer
+        video_tensor = mx.clip(video_tensor * 255.0 + 0.5, 0, 255).astype(mx.uint8)
+        
+        # Convert to numpy for imageio
+        video_np = np.array(video_tensor)
+        logging.debug(f"� Final video shape: {video_np.shape}")
+        
+        # Write video
         logging.debug(f"🎬 Starting video encoding with codec: libx264, fps: {fps}")
         writer = imageio.get_writer(output_file, fps=fps, codec="libx264", quality=8)
-        for i, frame in enumerate(video_grid):
-            if i % 20 == 0 or i == len(video_grid) - 1:
-                logging.debug(f"✍️  Writing frame {i+1}/{len(video_grid)}")
+        for i, frame in enumerate(video_np):
+            if i % 20 == 0 or i == len(video_np) - 1:
+                logging.debug(f"✍️  Writing frame {i+1}/{len(video_np)}")
             writer.append_data(frame)
         writer.close()
+        
         logging.info(f"✅ Video saved successfully: {output_file}")
-        logging.info(f"📊 Final video: {len(video_grid)} frames, {video_grid[0].shape[1]}x{video_grid[0].shape[0]}")
+        logging.info(f"📊 Final video: {len(video_np)} frames, {video_np[0].shape[1]}x{video_np[0].shape[0]}")
+        
     except Exception as e:
         logging.error(f"❌ save_video failed, error: {e}")
         raise
@@ -124,40 +150,34 @@ def save_image(
     normalize: bool = True,
     value_range=(-1, 1),
 ):
-    # Convert to numpy
-    img_np = np.array(tensor, copy=False)
+    """Saves a batch of images as a single grid image file."""
+    suffix = osp.splitext(save_file)[1]
+    if suffix.lower() not in ['.jpg', '.jpeg', '.png', '.tiff', '.gif', '.webp']:
+        save_file = osp.splitext(save_file)[0] + '.png'
 
-    # Clamp and normalize
-    img_np = np.clip(img_np, value_range[0], value_range[1])
-    if normalize:
-        img_np = (img_np - value_range[0]) / (value_range[1] - value_range[0])
-
-    # Create grid
-    b, c, h, w = img_np.shape
-    ncols = min(b, nrow)
-    nrows = (b + ncols - 1) // ncols
-    grid = np.zeros(
-        (c, h * nrows + (nrows - 1), w * ncols + (ncols - 1)), dtype=img_np.dtype
-    )
-    for i in range(b):
-        row = i // ncols
-        col = i % ncols
-        grid[
-            :,
-            row * (h + 1) : row * (h + 1) + h,
-            col * (w + 1) : col * (w + 1) + w,
-        ] = img_np[i]
-
-    # Transpose and scale
-    grid = np.transpose(grid, (1, 2, 0))
-    grid = (grid * 255).astype(np.uint8)
-
-    # Save image
     try:
-        imageio.imwrite(save_file, grid)
+        # Clamp tensor values to the specified range
+        tensor = mx.clip(tensor, min(value_range), max(value_range))
+        
+        # Create grid using MLX operations
+        grid = _make_grid_mlx(tensor, nrow=nrow, normalize=normalize, value_range=value_range)
+        
+        # Scale to [0, 255] and cast to uint8
+        img_arr = mx.clip(grid * 255.0 + 0.5, 0, 255).astype(mx.uint8)
+
+        # Transpose from (C, H, W) to (H, W, C) for imageio
+        if img_arr.shape[0] == 1:  # Grayscale
+            img_arr = img_arr[0]
+        else:  # RGB
+            img_arr = img_arr.transpose(1, 2, 0)
+        
+        # Convert to numpy and save
+        imageio.imwrite(save_file, np.array(img_arr))
         return save_file
+        
     except Exception as e:
-        logging.info(f"save_image failed, error: {e}")
+        logging.error(f"❌ save_image failed, error: {e}")
+        raise
 
 
 def str2bool(v):

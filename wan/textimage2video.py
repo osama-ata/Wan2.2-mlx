@@ -5,6 +5,7 @@ import math
 import os
 import random
 import sys
+import time
 from contextlib import contextmanager
 from functools import partial
 
@@ -16,7 +17,7 @@ from tqdm import tqdm
 
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
-from .modules.vae_simple import Wan2_1_VAE
+from .modules.vae2_2_complete import Wan2_2_VAE_Complete
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -47,24 +48,63 @@ class WanTI2V:
         )
         logging.info("✅ T5 text encoder loaded successfully")
 
-        logging.info("🎨 Loading VAE model...")
-        self.vae = Wan2_1_VAE(
+        logging.info("🎨 Loading sophisticated Wan2.2-VAE with patchification...")
+        vae_start_time = time.time()
+        
+        # Use the proper sophisticated Wan2.2-VAE implementation 
+        self.vae = Wan2_2_VAE_Complete(
+            z_dim=48,  # 48 latent channels for TI2V-5B
+            c_dim=160,  # Base dimension
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+            dtype=self.param_dtype
         )
-        logging.info("✅ VAE model loaded successfully")
+        
+        vae_load_time = time.time() - vae_start_time
+        logging.info(f"✅ Sophisticated Wan2.2-VAE loaded successfully in {vae_load_time:.2f}s")
         
         logging.info("🧠 Loading main transformer model...")
         # Load model using from_pretrained method that handles parameter mapping
         self.model = WanModel.from_pretrained(checkpoint_dir, "wan_model_mlx.safetensors", model_type='ti2v')
+        self._configure_model(self.model)
         logging.info("✅ Main transformer model loaded successfully")
 
         self.sample_neg_prompt = config.sample_neg_prompt
         logging.info("🚀 WanTI2V pipeline initialization completed")
 
+    def _configure_model(self, model: nn.Module):
+        """Configures the MLX model for inference."""
+        model.eval()
+        logging.info("Model configured for evaluation and parameters are frozen.")
+        return model
+
     def _pil_to_mx(self, img):
-        img = np.array(img, dtype=np.float32) / 255.0
-        img = (img - 0.5) / 0.5
-        return mx.array(img).transpose(2, 0, 1)
+        """Converts PIL image to MLX tensor with proper normalization."""
+        img_np = np.array(img, dtype=np.float32) / 255.0
+        img_mx = mx.array(img_np)
+        img_mx = (img_mx - 0.5) / 0.5
+        return img_mx.transpose(2, 0, 1)
+
+    def _preprocess_image(self, img: Image.Image, max_area: int):
+        """
+        Preprocesses a PIL image for the i2v task using MLX.
+        Returns both the processed tensor and the output size.
+        """
+        ih, iw = img.height, img.width
+        dh = self.config.patch_size[1] * self.config.vae_stride[1]
+        dw = self.config.patch_size[2] * self.config.vae_stride[2]
+        ow, oh = best_output_size(iw, ih, dw, dh, max_area)
+
+        scale = max(ow / iw, oh / ih)
+        img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
+
+        # Center-crop
+        x1 = (img.width - ow) // 2
+        y1 = (img.height - oh) // 2
+        img = img.crop((x1, y1, x1 + ow, y1 + oh))
+
+        # Convert to MLX tensor and normalize to [-1, 1]
+        img_tensor = self._pil_to_mx(img)
+        return img_tensor, (oh, ow)
 
     def generate(
         self,
@@ -149,6 +189,10 @@ class WanTI2V:
         if seed >= 0:
             logging.info(f"🎲 Setting random seed: {seed}")
             mx.random.seed(seed)
+        else:
+            seed = random.randint(0, sys.maxsize)
+            mx.random.seed(seed)
+            logging.info(f"🎲 Generated random seed: {seed}")
 
         logging.info("🔤 Encoding text prompts...")
         context = self.text_encoder([input_prompt])
@@ -187,17 +231,24 @@ class WanTI2V:
         for i, t in enumerate(tqdm(timesteps)):
             logging.debug(f"🔄 Denoising step {i+1}/{len(timesteps)} - Timestep: {t}")
             timestep = mx.array([t])
-            noise_pred_cond = self.model(
-                [latents], timestep, context, seq_len
-            )[0]
-            noise_pred_uncond = self.model(
-                [latents], timestep, context_null, seq_len
-            )[0]
-            noise_pred = noise_pred_uncond + guide_scale * (
-                noise_pred_cond - noise_pred_uncond
-            )
+            
+            # Efficient batched processing for classifier-free guidance
+            latent_model_input = mx.concatenate([latents, latents], axis=0)
+            timestep_input = mx.concatenate([timestep, timestep], axis=0)
+            
+            # Process both conditional and unconditional in single forward pass
+            if isinstance(context, list) and isinstance(context_null, list):
+                context_input = [mx.concatenate([c, cn], axis=0) for c, cn in zip(context, context_null)]
+            else:
+                context_input = mx.concatenate([context, context_null], axis=0)
+            
+            noise_pred_batch = self.model([latent_model_input], timestep_input, context_input, seq_len)[0]
+            noise_pred_cond, noise_pred_uncond = mx.split(noise_pred_batch, 2, axis=0)
+            
+            # Apply classifier-free guidance
+            noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+            
             latent_output = sample_scheduler.step(noise_pred, t, latents)
-            # MLX schedulers always return SchedulerOutput with prev_sample attribute  
             latents = latent_output.prev_sample
             
             if i % 10 == 0 or i == len(timesteps) - 1:
@@ -205,6 +256,7 @@ class WanTI2V:
 
         logging.info("🎨 Decoding latents to video...")
         videos = self.vae.decode([latents])
+        mx.eval(videos)  # Ensure computation is complete
         logging.info("✅ Text-to-video generation completed")
         return videos[0]
 
@@ -222,31 +274,10 @@ class WanTI2V:
         seed=-1,
     ):
         logging.info("🎬 Starting image-to-video generation...")
-        ih, iw = img.height, img.width
-        logging.info(f"🖼️  Input image size: {iw}x{ih}")
         
-        dh, dw = (
-            self.config.patch_size[1] * self.config.vae_stride[1],
-            self.config.patch_size[2] * self.config.vae_stride[2],
-        )
-        logging.info(f"📐 Downsample factors: {dh}x{dw}")
-        
-        ow, oh = best_output_size(iw, ih, dw, dh, max_area)
-        logging.info(f"🎯 Target output size: {ow}x{oh} (max area: {max_area})")
-        
-        scale = max(ow / iw, oh / ih)
-        logging.info(f"📏 Scale factor: {scale:.4f}")
-        
-        img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
-        logging.info(f"🔄 Resized to: {img.width}x{img.height}")
-        
-        x1 = (img.width - ow) // 2
-        y1 = (img.height - oh) // 2
-        img = img.crop((x1, y1, x1 + ow, y1 + oh))
-        logging.info(f"✂️  Cropped to: {img.width}x{img.height} (offset: {x1}, {y1})")
-        
-        img = self._pil_to_mx(img)
-        logging.info(f"📊 Image tensor shape: {img.shape}")
+        # Use improved preprocessing
+        img_tensor, (oh, ow) = self._preprocess_image(img, max_area)
+        logging.info(f"📊 Image tensor shape: {img_tensor.shape}")
 
         F = frame_num
         seq_len = ((F - 1) // self.config.vae_stride[0] + 1) * (
@@ -259,6 +290,10 @@ class WanTI2V:
         if seed >= 0:
             logging.info(f"🎲 Setting random seed: {seed}")
             mx.random.seed(seed)
+        else:
+            seed = random.randint(0, sys.maxsize)
+            mx.random.seed(seed)
+            logging.info(f"🎲 Generated random seed: {seed}")
             
         noise_shape = (
             self.vae.model.z_dim,
@@ -285,7 +320,7 @@ class WanTI2V:
             logging.info(f"📊 Context lengths: {len(context) if isinstance(context, (list, tuple)) else 'unknown'}")
         
         logging.info("🎨 Encoding input image...")
-        z = self.vae.encode([img])
+        z = self.vae.encode([img_tensor])
         logging.info(f"✅ Image encoding completed - Latent shape: {z[0].shape}")
 
         logging.info(f"⚙️  Initializing {sample_solver} scheduler...")
@@ -318,13 +353,24 @@ class WanTI2V:
         for i, t in enumerate(tqdm(timesteps)):
             logging.debug(f"🔄 Denoising step {i+1}/{len(timesteps)} - Timestep: {t}")
             timestep = mx.array([t])
-            noise_pred_cond = self.model([latent], timestep, context, seq_len)[0]
-            noise_pred_uncond = self.model([latent], timestep, context_null, seq_len)[0]
-            noise_pred = noise_pred_uncond + guide_scale * (
-                noise_pred_cond - noise_pred_uncond
-            )
+            
+            # Efficient batched processing for classifier-free guidance
+            latent_model_input = mx.concatenate([latent, latent], axis=0)
+            timestep_input = mx.concatenate([timestep, timestep], axis=0)
+            
+            # Process both conditional and unconditional in single forward pass
+            if isinstance(context, list) and isinstance(context_null, list):
+                context_input = [mx.concatenate([c, cn], axis=0) for c, cn in zip(context, context_null)]
+            else:
+                context_input = mx.concatenate([context, context_null], axis=0)
+            
+            noise_pred_batch = self.model([latent_model_input], timestep_input, context_input, seq_len)[0]
+            noise_pred_cond, noise_pred_uncond = mx.split(noise_pred_batch, 2, axis=0)
+            
+            # Apply classifier-free guidance
+            noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+            
             latent_output = sample_scheduler.step(noise_pred, t, latent)
-            # MLX schedulers always return SchedulerOutput with prev_sample attribute
             latent = latent_output.prev_sample
             latent = (1.0 - mask2) * z[0] + mask2 * latent
             
@@ -333,5 +379,6 @@ class WanTI2V:
 
         logging.info("🎨 Decoding latents to video...")
         videos = self.vae.decode([latent])
+        mx.eval(videos)  # Ensure computation is complete
         logging.info("✅ Image-to-video generation completed")
         return videos[0]
