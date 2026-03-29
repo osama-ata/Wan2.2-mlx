@@ -1,4 +1,4 @@
-# Wan2.2 (MLX Edition)
+# Wan2.2 (MLX Edition) **Failed**
 
 <p align="center">
     <img src="assets/logo.png" width="400"/>
